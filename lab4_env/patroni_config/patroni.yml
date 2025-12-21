@@ -1,0 +1,57 @@
+scope: postgres-cluster
+namespace: /service/
+name: PATRONI_NAME
+
+etcd3:
+  host: etcd:2379
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: PATRONI_NAME:8008
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_connections: 100
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_log_hints: "on"
+
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+  pg_hba:
+    - host replication repl_user 0.0.0.0/0 md5
+    - host all all 0.0.0.0/0 md5
+
+  users:
+    repl_user:
+      password: repl_pass
+      options:
+        - replication
+    postgres:
+      password: postgres
+      options:
+        - createrole
+        - createdb
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: PATRONI_NAME:5432
+  data_dir: /home/postgres/pgdata/data
+  authentication:
+    replication:
+      username: repl_user
+      password: repl_pass
+    superuser:
+      username: postgres
+      password: postgres
