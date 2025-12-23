@@ -25,6 +25,27 @@ By the end of Lab 4, you will:
 - Consistent, tested process
 - Built-in health checks
 
+### Where consensus does appear in PostgreSQL HA
+#### Single-primary HA (failover systems)
+
+Tools like:
+- Patroni
+- repmgr
+- pg_auto_failover
+
+introduce external consensus systems, usually:
+- etcd
+- Consul
+- ZooKeeper
+
+These systems answer:
+
+```
+“Who is the leader right now?”
+```
+
+Only the node that wins consensus can accept writes.
+
 ### How Patroni Works
 
 ```
@@ -671,15 +692,114 @@ pg_basebackup -h new_primary -D /var/lib/postgresql/data -U repl_user -P
 
 ## Step 11: Test Split-Brain Protection (Optional)
 
-### View current cluster state
+### What is Split-Brain?
+
+**Split-brain** is a dangerous condition in distributed systems where:
+- Two or more nodes believe they are the primary/leader
+- Each accepts writes independently
+- Data diverges between nodes
+- **Data loss or corruption** when the partition heals
+
+**Example scenario:**
+```
+┌─────────────────────────────────────────────┐
+│  BEFORE: Healthy Cluster                    │
+├─────────────────────────────────────────────┤
+│                                             │
+│    patroni1 (Primary) ───┐                 │
+│                          │                 │
+│    patroni2 (Replica) ───┼──► etcd         │
+│                          │    (consensus)  │
+│    patroni3 (Replica) ───┘                 │
+│                                             │
+└─────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────┐
+│  DURING: Network Partition (BAD!)           │
+├─────────────────────────────────────────────┤
+│                                             │
+│    patroni1 (Primary) ──X── etcd           │
+│    Still thinks it's leader!               │
+│    Accepts writes!                         │
+│                                             │
+│    patroni2 (Replica) ───┐                 │
+│                          ├──► etcd         │
+│    patroni3 (Replica) ───┘                 │
+│    Promoted to Primary!                    │
+│    Also accepts writes!                    │
+│                                             │
+│    ❌ TWO PRIMARIES! (SPLIT-BRAIN)          │
+└─────────────────────────────────────────────┘
+```
+
+### How Patroni Prevents Split-Brain
+
+Patroni uses **fencing via DCS (etcd) lock**:
+
+1. **Single source of truth:** Only the node holding the leader lock in etcd can be primary
+2. **TTL-based leasing:** Leader must renew lock every 10 seconds
+3. **Self-fencing:** Node that can't renew lock automatically demotes itself to replica
+4. **Distributed consensus:** etcd ensures only one node holds the lock at a time
+
+```
+┌─────────────────────────────────────────────┐
+│  Patroni's Protection (GOOD!)               │
+├─────────────────────────────────────────────┤
+│                                             │
+│    patroni1 (was Primary) ──X── etcd       │
+│    Can't renew lock!                       │
+│    ✅ AUTOMATICALLY DEMOTES to replica     │
+│    ✅ Stops accepting writes               │
+│                                             │
+│    patroni2 (Replica) ───┐                 │
+│                          ├──► etcd         │
+│    patroni3 (Replica) ───┘                 │
+│    ✅ patroni2 or patroni3 acquires lock   │
+│    ✅ Only ONE primary at a time           │
+│                                             │
+└─────────────────────────────────────────────┘
+```
+
+---
+
+## Split-Brain Scenario: Step-by-Step Demo
+
+### Prerequisites
+
+Ensure your cluster is healthy:
 
 ```bash
 docker exec patroni2 patronictl list
 ```
 
-Note which node is the leader.
+**Expected:** 1 Leader, 2 Replicas, all streaming.
 
-### Check etcd to see the leader lock
+---
+
+### Scenario 1: Network Partition Between Leader and etcd
+
+This simulates the most common split-brain risk: the leader loses connection to the consensus store.
+
+#### Step 1: Identify current leader
+
+```bash
+docker exec patroni1 patronictl list
+```
+
+**Example output:**
+```
++ Cluster: postgres-cluster (7586222173663928380) -+-----------+
+| Member   | Host       | Role    | State     | TL | Lag in MB |
++----------+------------+---------+-----------+----+-----------+
+| patroni1 | 172.21.0.3 | Leader  | running   |  2 |           |
+| patroni2 | 172.21.0.4 | Replica | streaming |  2 |         0 |
+| patroni3 | 172.21.0.5 | Replica | streaming |  2 |         0 |
++----------+------------+---------+-----------+----+-----------+
+```
+
+**Assume patroni1 is the leader for this demo.**
+
+#### Step 2: View the leader lock in etcd
 
 ```bash
 docker exec etcd etcdctl --endpoints=http://localhost:2379 get --prefix /service/
@@ -688,47 +808,285 @@ docker exec etcd etcdctl --endpoints=http://localhost:2379 get --prefix /service
 **Look for:**
 ```
 /service/postgres-cluster/leader
-{"patroni2"}
+{"patroni1"}
+
+/service/postgres-cluster/members/patroni1
+{...}
+
+/service/postgres-cluster/members/patroni2
+{...}
+
+/service/postgres-cluster/members/patroni3
+{...}
 ```
 
-This is the **single source of truth**!
+The `/service/postgres-cluster/leader` key is the **single source of truth**!
 
-### Simulate network partition (Advanced)
-
-**Warning:** This requires iptables and may not work on all systems.
+#### Step 3: Insert test data before partition
 
 ```bash
-# Block patroni2 (current leader) from reaching etcd
-docker exec patroni2 iptables -A OUTPUT -d $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' etcd) -j DROP
+docker exec -it patroni1 psql -U postgres << 'EOF'
+INSERT INTO failover_test (message) VALUES ('Before split-brain test');
+
+SELECT id, message FROM failover_test ORDER BY id DESC LIMIT 1;
+EOF
 ```
 
-### Watch what happens
+**Note the last ID inserted.**
+
+#### Step 4: Simulate network partition
+
+Block patroni1 (current leader) from reaching etcd:
 
 ```bash
-watch -n 2 'docker exec patroni3 patronictl list'
+# Get etcd's IP address
+ETCD_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' etcd)
+
+echo "Blocking patroni1 from reaching etcd at $ETCD_IP"
+
+# Block patroni1 → etcd communication
+docker exec patroni1 iptables -A OUTPUT -d $ETCD_IP -j DROP
 ```
 
-**Expected behavior:**
-1. patroni2 can't renew its leader lock
-2. After 30 seconds, lock expires
-3. patroni2 **automatically demotes itself** to replica
-4. patroni3 becomes new leader
-5. **No split-brain!** Only one leader at a time
+**What happens now:**
+- patroni1 can still run PostgreSQL
+- patroni1 can't reach etcd to renew its leader lock
+- patroni2 and patroni3 can still reach etcd
 
-### Heal the partition
+#### Step 5: Watch the automatic failover in real-time
+
+Open **two terminal windows side-by-side**:
+
+**Terminal 1:** Watch cluster state from patroni2's perspective
+```bash
+watch -n 2 'docker exec patroni2 patronictl list'
+```
+
+**Terminal 2:** Watch patroni1's logs
+```bash
+docker logs -f patroni1 2>&1 | grep -E "lock|demote|promote|leader"
+```
+
+#### Step 6: Observe the timeline
+
+**T+0s to T+30s:** patroni1 tries to renew lock but fails
+```
+patroni1 logs:
+"ERROR: etcd is not accessible"
+"Failed to renew leader lock"
+"I am the leader but cannot reach DCS"
+```
+
+**T+30s:** Leader lock expires in etcd (TTL = 30 seconds)
+```
+patroni2 logs:
+"Leader key released"
+"Attempting to acquire leader lock"
+```
+
+**T+35s:** patroni2 or patroni3 wins the leader election
+```
+patroni2 logs:
+"Successfully acquired leader lock"
+"Promoting PostgreSQL to primary"
+```
+
+**T+40s:** New leader is fully operational
+```
+patroni2 logs:
+"I am now the leader with the lock"
+"PostgreSQL is running as primary"
+```
+
+**T+40s:** patroni1 detects it lost the lock (even though it couldn't reach etcd)
+```
+patroni1 logs:
+"I do not have the lock anymore"
+"Demoting PostgreSQL to replica"
+"✅ SELF-FENCING: Stopped accepting writes"
+```
+
+**Press Ctrl+C in both terminals to exit.**
+
+#### Step 7: Verify final cluster state
+
+```bash
+docker exec patroni2 patronictl list
+```
+
+**Expected output:**
+```
++ Cluster: postgres-cluster (7586222173663928380) -+-----------+
+| Member   | Host       | Role    | State     | TL | Lag in MB |
++----------+------------+---------+-----------+----+-----------+
+| patroni2 | 172.21.0.4 | Leader  | running   |  3 |           |
+| patroni3 | 172.21.0.5 | Replica | streaming |  3 |         0 |
++----------+------------+---------+-----------+----+-----------+
+```
+
+**Notice:**
+- ✅ patroni1 is **missing** (can't reach etcd to register itself)
+- ✅ patroni2 is now the **Leader** (won the election)
+- ✅ Timeline incremented to **3** (new timeline after failover)
+- ✅ **Only ONE leader!** No split-brain!
+
+#### Step 8: Verify patroni1 demoted itself
+
+Try to insert data into patroni1 (should fail):
+
+```bash
+docker exec -it patroni1 psql -U postgres -c "INSERT INTO failover_test (message) VALUES ('This should fail');"
+```
+
+**Expected error:**
+```
+ERROR:  cannot execute INSERT in a read-only transaction
+```
+
+✅ **Success!** patroni1 demoted itself to read-only (replica mode) even though it couldn't reach etcd!
+
+**How did this work?**
+- Patroni tracks the lock TTL locally
+- Even without etcd access, patroni1 knows its lock expired
+- It self-fences by demoting PostgreSQL to standby mode
+- **This prevents split-brain!**
+
+#### Step 9: Heal the network partition
+
+Restore connectivity between patroni1 and etcd:
 
 ```bash
 # Restore network connectivity
-docker exec patroni2 iptables -F  # Flush all rules
+docker exec patroni1 iptables -F  # Flush all iptables rules
 
-# Wait 30 seconds
+echo "Network partition healed. Waiting 30 seconds for patroni1 to rejoin..."
 sleep 30
-
-# Check cluster
-docker exec patroni3 patronictl list
 ```
 
-**Expected:** patroni2 rejoins as replica automatically!
+#### Step 10: Verify patroni1 rejoined as replica
+
+```bash
+docker exec patroni2 patronictl list
+```
+
+**Expected output:**
+```
++ Cluster: postgres-cluster (7586222173663928380) -+-----------+
+| Member   | Host       | Role    | State     | TL | Lag in MB |
++----------+------------+---------+-----------+----+-----------+
+| patroni1 | 172.21.0.3 | Replica | streaming |  3 |         0 |
+| patroni2 | 172.21.0.4 | Leader  | running   |  3 |           |
+| patroni3 | 172.21.0.5 | Replica | streaming |  3 |         0 |
++----------+------------+---------+-----------+----+-----------+
+```
+
+**Notice:**
+- ✅ patroni1 rejoined as **Replica** (not leader)
+- ✅ All nodes on **Timeline 3** (synchronized)
+- ✅ patroni1 used `pg_rewind` to resync data
+- ✅ **Zero manual intervention!**
+
+#### Step 11: Verify data consistency
+
+Check that all nodes have consistent data:
+
+```bash
+# Check patroni1 (rejoined replica)
+docker exec -it patroni1 psql -U postgres -c "SELECT id, message FROM failover_test ORDER BY id;"
+
+# Check patroni2 (current leader)
+docker exec -it patroni2 psql -U postgres -c "SELECT id, message FROM failover_test ORDER BY id;"
+
+# Check patroni3 (replica)
+docker exec -it patroni3 psql -U postgres -c "SELECT id, message FROM failover_test ORDER BY id;"
+```
+
+**Expected:** ✅ All three nodes show identical data!
+
+---
+
+### Scenario 2: What Happens WITHOUT Split-Brain Protection?
+
+**For educational comparison, here's what would happen without Patroni's fencing:**
+
+```
+┌─────────────────────────────────────────────┐
+│  WITHOUT FENCING (Disaster!)                │
+├─────────────────────────────────────────────┤
+│                                             │
+│  T+0s:   Network partition occurs          │
+│                                             │
+│  T+30s:  patroni2 becomes new leader       │
+│          patroni1 still thinks it's leader │
+│                                             │
+│  App writes to patroni1:                   │
+│    INSERT: user_id=100, balance=1000       │
+│                                             │
+│  App writes to patroni2:                   │
+│    INSERT: user_id=100, balance=500        │
+│                                             │
+│  ❌ TWO DIFFERENT VALUES for same row!     │
+│                                             │
+│  T+60s:  Network heals                     │
+│                                             │
+│  T+65s:  Conflict detected!                │
+│          Which value is correct?           │
+│          balance=1000 or balance=500?      │
+│                                             │
+│  Manual intervention required:             │
+│  - Compare transaction logs               │
+│  - Decide which data to keep              │
+│  - Manually merge conflicting rows        │
+│  - Hope no data corruption                │
+│                                             │
+│  ❌ Data loss, downtime, manual work!      │
+│                                             │
+└─────────────────────────────────────────────┘
+```
+
+**With Patroni's fencing:**
+```
+✅ patroni1 automatically demotes itself
+✅ Only patroni2 accepts writes
+✅ No conflicting data
+✅ Automatic rejoin with pg_rewind
+✅ Zero data loss
+✅ Zero manual intervention
+```
+
+---
+
+### Summary: Split-Brain Protection Mechanisms
+
+| Mechanism | How It Works | What It Prevents |
+|-----------|--------------|------------------|
+| **DCS Lock (etcd)** | Only one node can hold leader lock | Multiple nodes becoming primary |
+| **TTL-based leasing** | Lock expires after 30 seconds | Indefinite lock holding |
+| **Self-fencing** | Node demotes itself if can't renew lock | Accepting writes without consensus |
+| **pg_rewind** | Resyncs diverged WAL after partition | Manual rebuild of old primary |
+| **Health checks** | Continuous monitoring every 10 seconds | Undetected failures |
+| **Timeline tracking** | New timeline after each failover | Data inconsistency |
+
+---
+
+### Key Takeaways from Split-Brain Test
+
+1. ✅ **Patroni prevents split-brain automatically** - no manual intervention
+2. ✅ **Self-fencing works even without etcd access** - local TTL tracking
+3. ✅ **Old leader rejoins as replica** - correct behavior
+4. ✅ **pg_rewind enables fast recovery** - no full rebuild needed
+5. ✅ **Zero data loss or corruption** - only one writer at a time
+6. ✅ **Timeline tracking ensures consistency** - all nodes synchronized
+
+### Comparison with Other Systems
+
+| System | Split-Brain Protection | How It Works |
+|--------|------------------------|--------------|
+| **Patroni + etcd** | ✅ Yes | DCS lock + self-fencing |
+| **Manual failover** | ❌ No | Human must ensure no dual primaries |
+| **repmgr** | ⚠️ Partial | Requires witness node, manual fencing |
+| **PostgreSQL built-in** | ❌ No | No built-in coordination |
+| **Multi-master (LAB 5)** | ⚠️ Different | Uses conflict resolution instead |
 
 ---
 
