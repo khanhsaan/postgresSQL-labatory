@@ -1,0 +1,66 @@
+services:
+  pg1:
+    image: postgres:16
+    container_name: lab6_pg1
+    hostname: pg1
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: testdb
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg1_data:/var/lib/postgresql/data
+      - ./init/init_pg1.sql:/docker-entrypoint-initdb.d/init_pg1.sql
+    networks:
+      - logical_net
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=5"
+      - "-c"
+      - "max_wal_senders=5"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d testdb" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  pg2:
+    image: postgres:16
+    container_name: lab6_pg2
+    hostname: pg2
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: testdb
+    ports:
+      - "5434:5432"
+    volumes:
+      - pg2_data:/var/lib/postgresql/data
+      - ./init/init_pg2.sql:/docker-entrypoint-initdb.d/init_pg2.sql
+    networks:
+      - logical_net
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=5"
+      - "-c"
+      - "max_wal_senders=5"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d testdb" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+networks:
+  logical_net:
+    driver: bridge
+
+volumes:
+  pg1_data:
+  pg2_data:

@@ -1274,7 +1274,7 @@ docker exec -it lab6_pg2 psql -U postgres -d testdb -c \
 ### Remove Subscription (on pg2)
 
 ```bash
-docker exec -it lab6_pg2 psql -U postgres -d testdb << 'EOF'
+docker exec -i lab6_pg2 psql -U postgres -d testdb << 'EOF'
 -- Drop subscription (also removes replication slot on pg1)
 DROP SUBSCRIPTION IF EXISTS my_subscription;
 EOF
@@ -1283,7 +1283,7 @@ EOF
 ### Remove Publication (on pg1)
 
 ```bash
-docker exec -it lab6_pg1 psql -U postgres -d testdb << 'EOF'
+docker exec -i lab6_pg1 psql -U postgres -d testdb << 'EOF'
 -- Drop publication
 DROP PUBLICATION IF EXISTS my_publication;
 EOF
